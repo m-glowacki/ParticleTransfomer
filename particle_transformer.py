@@ -4,18 +4,20 @@ import torch.nn.functional as F
 
 
 class Embed(nn.Module):
-    def __init__(self, input_dim, output_dim, normalize_input=True, activation='gelu'):
+    def __init__(self, input_dim, output_dim, normalize_input=True, event_level=False, activation='gelu'):
         super().__init__()
 
         self.input_bn = nn.BatchNorm1d(input_dim) if normalize_input else None
         self.linear = nn.Linear(input_dim, output_dim)
         self.activation = F.gelu
+        self.event_level = event_level
 
     def forward(self, x):
         if self.input_bn is not None:
             # x: (batch, embed_dim, seq_len)
             x = self.input_bn(x)
-            x = x.permute(2, 0, 1).contiguous()
+            if not self.event_level: 
+                x = x.permute(2, 0, 1).contiguous()
 
         # x: (seq_len, batch, embed_dim)
         x = self.linear(x)
@@ -36,17 +38,17 @@ class AttBlock(nn.Module):
         self.layer_norm3 = nn.LayerNorm(linear_dims1)
         self.linear2 = nn.Linear(linear_dims1, linear_dims2)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, padding_mask=None):
         # Layer normalization 1
         x = self.layer_norm1(x)
 
-        # Multihead Attention
-        if mask is not None:
-            # Ensure mask has the correct shape for attention
-            mask = mask.unsqueeze(1).expand(-1, x.size(1), -1)
+        if padding_mask is not None:
+        # Assuming mask is 0 for non-padded and 1 for padded elements,
+        # convert it to a boolean tensor with `True` for padded locations.
+            padding_mask = padding_mask.bool()
 
-        x_att, _ = self.multihead_attention(x, x, x, attn_mask=mask)
-
+        x_att, attention = self.multihead_attention(x, x, x, key_padding_mask=padding_mask, need_weights=True, average_attn_weights=True)
+        
         # Skip connection
         x = x + x_att # Skip connection
         # Layer normalization 2
@@ -61,7 +63,7 @@ class AttBlock(nn.Module):
         x_linear2 = self.linear2(x)
         # Skip connection for the second linear layer
         x = x + x_linear2
-        return x
+        return x, attention
 
 class ClassBlock(nn.Module):
     def __init__(self, embed_dims, linear_dims1, linear_dims2, num_heads=8, activation='relu'):
@@ -75,7 +77,7 @@ class ClassBlock(nn.Module):
         self.layer_norm3 = nn.LayerNorm(linear_dims1)
         self.linear2 = nn.Linear(linear_dims1, linear_dims2)
 
-    def forward(self, x, class_token, mask=None):
+    def forward(self, x, class_token, padding_mask=None):
         # Concatenate the class token to the input sequence along the sequence length dimension
         x = torch.cat((class_token, x), dim=0)  # (seq_len+1, batch, embed_dim)
 
@@ -83,12 +85,13 @@ class ClassBlock(nn.Module):
         x = self.layer_norm1(x)
 
         # Multihead Attention
-        if mask is not None:
+        if padding_mask is not None:
             # Ensure mask has the correct shape for attention
-            mask = mask.unsqueeze(1).expand(-1, x.size(1), -1)
-
-        x_att, _ = self.multihead_attention(class_token, x, x, attn_mask=mask)
-
+            padding_mask = torch.cat((torch.zeros_like(padding_mask[:, :1]), padding_mask), dim=1)
+            padding_mask = padding_mask.bool()
+        
+        
+        x_att, attention = self.multihead_attention(class_token, x, x, key_padding_mask=padding_mask, need_weights=True, average_attn_weights=False)
         # Layer normalization 2
         x = self.layer_norm2(x_att)
         x = class_token + x  # Skip connection
@@ -100,16 +103,29 @@ class ClassBlock(nn.Module):
         x_linear2 = self.linear2(x_linear1 )
         # Skip connection for the second linear layer
         x = x + x_linear2
+        return x, attention
+
+class MLPHead(nn.Module):
+    def __init__(self, input_dim, hidden_dim1, hidden_dim2, output_dim):
+        super(MLPHead, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim1)
+        self.fc2 = nn.Linear(hidden_dim1, hidden_dim2)
+        self.fc3 = nn.Linear(hidden_dim2, output_dim)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
         return x
     
     
-
 class AnalysisObjectTransformer(nn.Module):
-    def __init__(self, input_dim, embed_dims, linear_dims1, linear_dims2, num_heads=8):
+    def __init__(self, input_dim_obj, input_dim_event, embed_dims, linear_dims1, linear_dims2, mlp_hidden_1, mlp_hidden_2, num_heads=8):
         super(AnalysisObjectTransformer, self).__init__()
 
         # Embedding layer (assumed to be external)
-        self.embedding_layer = Embed(input_dim, embed_dims)
+        self.embedding_layer = Embed(input_dim_obj, embed_dims)
+        self.embedding_layer_event_level = Embed(input_dim_event, embed_dims, event_level=True)
 
         # Three blocks of self-attention
         self.block1 = AttBlock(embed_dims, linear_dims1, linear_dims1, num_heads)
@@ -121,30 +137,37 @@ class AnalysisObjectTransformer(nn.Module):
 
         # Output linear layer and sigmoid activation
 
-        self.linear_output = nn.Linear(linear_dims2, 1)
+        self.mlp = MLPHead(embed_dims *2, mlp_hidden_1, mlp_hidden_2, output_dim=1)
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x, mask=None):
+    def forward(self, x, event_level, mask=None):
 
         cls_token = nn.Parameter(torch.zeros(1, 1, 64), requires_grad=True)
         # Embedding layer
         x = self.embedding_layer(x)
 
+        attention_weights = []
+
         # Three blocks of self-attention
-        x = self.block1(x, mask)
-        x = self.block2(x, mask)
-        x = self.block3(x, mask)
-        cls_tokens = cls_token.expand(1, x.size(1), -1)  # (1, N, C)
-        cls_tokens  = self.block5(x, cls_tokens, mask)
-        cls_tokens  = self.block6(x, cls_tokens, mask)
-        cls_tokens  = self.block7(x, cls_tokens, mask)
+        x, attention = self.block1(x, padding_mask=mask)
+        attention_weights.append(attention)
+        x, attention  = self.block2(x, padding_mask=mask)
+        attention_weights.append(attention)
+        x, attention = self.block3(x, padding_mask=mask)
+        attention_weights.append(attention)
+
+        cls_tokens  = cls_token.expand(1, x.size(1), -1)  # (1, N, C)
+        cls_tokens, attention  = self.block5(x, cls_tokens, padding_mask=mask)
+        cls_tokens, attention  = self.block6(x, cls_tokens, padding_mask=mask)
+        cls_tokens, attention  = self.block7(x, cls_tokens, padding_mask=mask)
 
         # Global average pooling (assuming sequence length is the first dimension)
         x = x.mean(dim=0)
 
-        # Output linear layer and sigmoid activation
-        x = self.linear_output(x)
-        output_probabilities = self.sigmoid(x)
+        event_level = self.embedding_layer_event_level(event_level)
 
-        return output_probabilities
+        x = torch.cat((x, event_level), dim=1)
+        x = self.mlp(x)
+        output_probabilities = self.sigmoid(x)
+        return output_probabilities, attention_weights
 
